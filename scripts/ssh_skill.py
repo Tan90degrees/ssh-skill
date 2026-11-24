@@ -75,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("remote_path")
     upload.add_argument("--resume", action="store_true")
     upload.add_argument("--recursive", action="store_true")
+    upload.add_argument("--backend", choices=("auto", "openssh", "paramiko", "asyncssh"), default="auto")
+    upload.add_argument("--parallel", type=int, choices=range(1, 9), default=4)
     _add_progress_flags(upload)
 
     download = commands.add_parser("download", help="Download a file or directory")
@@ -240,6 +242,7 @@ def _upload_handler(args):
     _flag(values, args.resume, "--resume")
     _flag(values, args.recursive, "--recursive")
     _progress_flag(values, args.progress)
+    values.extend(["--backend", args.backend, "--parallel", str(args.parallel)])
     return _legacy_subprocess_handler("upload", "ssh_upload.py", values)
 
 

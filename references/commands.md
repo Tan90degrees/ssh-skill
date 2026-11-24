@@ -136,3 +136,17 @@ and WinSCP in SFTP mode. Record elapsed time and verify the remote checksum.
 Use distinct destination filenames and avoid concurrent transfers. A resumed
 file must have a matching prefix; matching sizes alone do not prove content
 identity. Do not resume unrelated files.
+
+Directory uploads use four reusable SFTP channels on one SSH connection by
+default. Set `--parallel 1` for servers with strict session limits, or choose
+up to 8. The parallel directory progress stream reports aggregate bytes.
+
+Use `--backend paramiko` to force the compatible Python SFTP path. An optional
+single-file high-throughput backend is available with `--backend asyncssh`;
+install it with `python -m pip install asyncssh`. It uses the server-negotiated
+block size, at most 64 outstanding requests, and structured progress. Verify
+and enroll the target and jump host keys in the standard known_hosts file
+before use. The backend rejects unknown or changed keys and never falls back
+automatically after a connection or transfer error. Resume and recursive
+uploads still use Paramiko. Default auto selection remains unchanged pending
+performance and integration validation.

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 from tests.support import *  # noqa: F401,F403
 from ssh_upload import use_native_upload
 from native_ssh_client import NativeSSHClient, _scp_tuning_args
-from sftp_transfer import SFTPTransfer
+from sftp_transfer import SFTPTransfer, TransferResult, parallel_upload
 from config_v3 import SSHConfigLoaderV3
 
 
@@ -71,6 +71,34 @@ class UploadPerformanceTests(unittest.TestCase):
             result = SFTPTransfer(sftp).upload_file(str(local), "/tmp/file.bin", resume=True)
             self.assertFalse(result.success)
             sftp.open.assert_not_called()
+
+    def test_parallel_upload_reuses_bounded_channels(self):
+        channels = []
+
+        def factory():
+            channel = MagicMock()
+            channels.append(channel)
+            return channel
+
+        def upload(self, local, remote, **kwargs):
+            return TransferResult(success=True, files_transferred=1, bytes_transferred=4)
+
+        with patch.object(SFTPTransfer, "upload_file", upload):
+            result = parallel_upload(factory, ((str(i), "/remote/" + str(i)) for i in range(100)),
+                                     max_workers=4)
+        self.assertEqual(100, result.files_transferred)
+        self.assertEqual(400, result.bytes_transferred)
+        self.assertTrue(1 <= len(channels) <= 4)
+        for channel in channels:
+            channel.close.assert_called_once()
+
+    def test_parallel_upload_collects_worker_errors(self):
+        with patch.object(SFTPTransfer, "upload_file", side_effect=OSError("test failure")):
+            channel = MagicMock()
+            result = parallel_upload(lambda: channel, [("file", "/remote")], max_workers=1)
+        self.assertFalse(result.success)
+        self.assertEqual(1, result.files_failed)
+        channel.close.assert_called_once()
 
     def test_jump_resolves_per_hop_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:

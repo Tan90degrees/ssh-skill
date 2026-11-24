@@ -26,6 +26,7 @@ import sys
 import os
 import json
 import argparse
+import asyncio
 import re
 import time
 from typing import TextIO
@@ -89,6 +90,10 @@ def _legacy_main(argv=None):
                         help='Enable resume for interrupted transfers')
     parser.add_argument('--recursive', action='store_true',
                         help='Upload directory recursively')
+    parser.add_argument('--backend', choices=('auto', 'openssh', 'paramiko', 'asyncssh'), default='auto',
+                        help='Transfer backend (AsyncSSH is optional)')
+    parser.add_argument('--parallel', type=int, choices=range(1, 9), default=4,
+                        help='Concurrent directory uploads (1-8; default 4)')
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument('--progress', dest='progress', action='store_true',
                                 help='Enable bounded JSONL progress on stderr')
@@ -117,7 +122,20 @@ def _legacy_main(argv=None):
         if os.path.isdir(local_path) and not args.recursive:
             raise ValueError('Directory upload requires --recursive')
 
-        if use_native:
+        if args.backend == 'openssh' and not use_native:
+            raise ValueError('OpenSSH backend requires key authentication, a simple path, and no resume, recursion or structured progress')
+        if args.backend == 'asyncssh':
+            if args.resume or args.recursive or not os.path.isfile(local_path):
+                raise ValueError('AsyncSSH currently supports single-file uploads without resume')
+            from asyncssh_transfer import upload_asyncssh
+            result = asyncio.run(upload_asyncssh(
+                params, loader.resolve_jump_hosts(params.get('proxy_jump')),
+                local_path, remote_path, make_progress_callback(args.progress),
+            ))
+            print(json.dumps({**result.to_dict(), 'backend': 'asyncssh'}, ensure_ascii=True, indent=2))
+            sys.exit(0 if result.success else 1)
+
+        if use_native and args.backend != 'paramiko':
             # 使用原生 SSH（简单上传，性能更好）
             client = loader.from_alias(args.alias)
             local_path = os.path.abspath(args.local_path)
@@ -134,7 +152,8 @@ def _legacy_main(argv=None):
                 'success': result.success,
                 'stdout': result.stdout,
                 'stderr': result.stderr,
-                'exit_code': result.exit_code
+                'exit_code': result.exit_code,
+                'backend': 'openssh'
             }, ensure_ascii=True, indent=2))
             sys.exit(0 if result.success else 1)
         else:
@@ -173,8 +192,15 @@ def _legacy_main(argv=None):
                     'error': f'"{args.local_path}" is a directory. Use --recursive to upload directories.'
                 }, ensure_ascii=True, indent=2), file=sys.stderr)
                 sys.exit(1)
-            result = transfer.upload_directory(local_path, remote_path,
-                                               resume=args.resume)
+            def sftp_factory():
+                channel = ssh_client.open_sftp()
+                channel.get_channel().settimeout(120)
+                return channel
+
+            result = transfer.upload_directory(
+                local_path, remote_path, resume=args.resume,
+                max_workers=args.parallel, sftp_factory=sftp_factory,
+            )
         elif os.path.isfile(local_path):
             result = transfer.upload_file(local_path, remote_path,
                                           resume=args.resume)
@@ -186,7 +212,7 @@ def _legacy_main(argv=None):
             sys.exit(1)
 
         # 输出结果
-        output = result.to_dict()
+        output = {**result.to_dict(), 'backend': 'paramiko'}
         print(json.dumps(output, ensure_ascii=True, indent=2))
         sys.exit(0 if result.success else 1)
 
