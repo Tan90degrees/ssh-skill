@@ -287,6 +287,7 @@ class SFTPTransfer:
                 with open(local_path, 'rb') as local_f:
                     local_f.seek(resume_offset)
                     with self.sftp.open(remote_path, 'ab') as remote_f:
+                        remote_f.set_pipelined(True)
                         while True:
                             chunk = local_f.read(CHUNK_SIZE)
                             if not chunk:
@@ -299,7 +300,7 @@ class SFTPTransfer:
                 # 全新上传：使用分块写入以支持进度回调
                 with open(local_path, 'rb') as local_f:
                     with self.sftp.open(remote_path, 'wb') as remote_f:
-                        # 设置预取缓冲区大小以提升性能
+                        # Pipeline SFTP writes instead of waiting for every ACK.
                         remote_f.set_pipelined(True)
                         while True:
                             chunk = local_f.read(CHUNK_SIZE)
@@ -309,6 +310,9 @@ class SFTPTransfer:
                             progress.transferred_bytes += len(chunk)
                             if self.progress_callback:
                                 self.progress_callback(progress)
+
+            if self.sftp.stat(remote_path).st_size != local_size:
+                raise IOError("Remote size does not match local file size")
 
             return TransferResult(
                 success=True,
