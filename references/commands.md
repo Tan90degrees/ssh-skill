@@ -150,3 +150,7 @@ before use. The backend rejects unknown or changed keys and never falls back
 automatically after a connection or transfer error. Resume and recursive
 uploads still use Paramiko. Default auto selection remains unchanged pending
 performance and integration validation.
+
+Paramiko downloads also pipeline reads in bounded 64-request batches (32 KiB
+per request), including resumed downloads. This avoids whole-file prefetch
+metadata growth and checks sizes before reporting successful completion.

@@ -175,7 +175,7 @@ def _legacy_main(argv=None):
             sftp = ssh_client.open_sftp()
 
             # 设置 SFTP 超时（大文件传输使用无限制）
-            sftp.get_channel().settimeout(None)
+            sftp.get_channel().settimeout(120)
 
             # 创建传输器
             from sftp_transfer import SFTPTransfer

@@ -23,6 +23,8 @@ except ImportError:
 
 CHUNK_SIZE = 128 * 1024  # 128KB 传输块（优化大文件传输性能）
 MAX_RESULT_ITEMS = 100
+DOWNLOAD_REQUEST_SIZE = 32 * 1024
+DOWNLOAD_REQUESTS = 64
 
 
 def _bounded_items(values: list, limit: int = MAX_RESULT_ITEMS) -> list:
@@ -298,7 +300,7 @@ class SFTPTransfer:
                                 break
                             remote_f.write(chunk)
                             progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
+                            if self.progress_callback and progress.transferred_bytes < local_size:
                                 self.progress_callback(progress)
             else:
                 # 全新上传：使用分块写入以支持进度回调
@@ -312,11 +314,13 @@ class SFTPTransfer:
                                 break
                             remote_f.write(chunk)
                             progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
+                            if self.progress_callback and progress.transferred_bytes < local_size:
                                 self.progress_callback(progress)
 
             if self.sftp.stat(remote_path).st_size != local_size:
                 raise IOError("Remote size does not match local file size")
+            if self.progress_callback:
+                self.progress_callback(progress)
 
             return TransferResult(
                 success=True,
@@ -371,7 +375,10 @@ class SFTPTransfer:
         resume_offset = 0
         if resume and os.path.exists(local_path):
             resume_offset = os.path.getsize(local_path)
-            if resume_offset >= remote_size:
+            if resume_offset > remote_size:
+                return TransferResult(success=False, files_failed=1,
+                                      errors=['Local file is larger than remote file; refusing resume'])
+            if resume_offset == remote_size:
                 return TransferResult(
                     success=True,
                     files_transferred=1,
@@ -392,31 +399,33 @@ class SFTPTransfer:
         )
 
         try:
-            if resume_offset > 0:
-                # 断点续传
-                with self.sftp.open(remote_path, 'rb') as remote_f:
-                    remote_f.seek(resume_offset)
-                    with open(local_path, 'ab') as local_f:
-                        while True:
-                            chunk = remote_f.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            local_f.write(chunk)
-                            progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
+            # readv pipelines a bounded batch of requests. Avoid prefetching
+            # the whole file, which can allocate millions of request records.
+            mode = 'ab' if resume_offset else 'wb'
+            with self.sftp.open(remote_path, 'rb') as remote_f:
+                with open(local_path, mode) as local_f:
+                    offset = resume_offset
+                    while offset < remote_size:
+                        batch_end = min(remote_size, offset + DOWNLOAD_REQUEST_SIZE * DOWNLOAD_REQUESTS)
+                        chunks = [(pos, min(DOWNLOAD_REQUEST_SIZE, batch_end - pos))
+                                  for pos in range(offset, batch_end, DOWNLOAD_REQUEST_SIZE)]
+                        blocks = iter(remote_f.readv(chunks))
+                        for _, expected in chunks:
+                            block = next(blocks, b'')
+                            if len(block) != expected:
+                                raise IOError("Remote file changed or returned a short read")
+                            local_f.write(block)
+                            offset += len(block)
+                            progress.transferred_bytes = offset
+                            if self.progress_callback and offset < remote_size:
                                 self.progress_callback(progress)
-            else:
-                # 全新下载
-                with self.sftp.open(remote_path, 'rb') as remote_f:
-                    with open(local_path, 'wb') as local_f:
-                        while True:
-                            chunk = remote_f.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            local_f.write(chunk)
-                            progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
-                                self.progress_callback(progress)
+                        # Exhaust generator so cleanup runs before the next batch.
+                        if next(blocks, None) is not None:
+                            raise IOError("Unexpected extra SFTP read data")
+            if os.path.getsize(local_path) != remote_size or self.sftp.stat(remote_path).st_size != remote_size:
+                raise IOError("File size changed during download")
+            if self.progress_callback:
+                self.progress_callback(progress)
 
             return TransferResult(
                 success=True,

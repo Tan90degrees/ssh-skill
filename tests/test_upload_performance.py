@@ -100,6 +100,29 @@ class UploadPerformanceTests(unittest.TestCase):
         self.assertEqual(1, result.files_failed)
         channel.close.assert_called_once()
 
+    def test_download_uses_bounded_readv_batches(self):
+        data = b"x" * (3 * 1024 * 1024 + 7)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "file.bin"
+            sftp = MagicMock()
+            sftp.stat.return_value.st_size = len(data)
+            remote = sftp.open.return_value.__enter__.return_value
+            remote.readv.side_effect = lambda chunks: iter(data[pos:pos + count] for pos, count in chunks)
+            result = SFTPTransfer(sftp).download_file("/remote", str(target))
+            self.assertTrue(result.success, result.errors)
+            self.assertEqual(data, target.read_bytes())
+            self.assertEqual(2, remote.readv.call_count)
+            self.assertTrue(all(len(call.args[0]) <= 64 for call in remote.readv.call_args_list))
+
+    def test_download_rejects_short_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "file.bin"
+            sftp = MagicMock()
+            sftp.stat.return_value.st_size = 10
+            sftp.open.return_value.__enter__.return_value.readv.return_value = iter([b"short"])
+            result = SFTPTransfer(sftp).download_file("/remote", str(target))
+            self.assertFalse(result.success)
+
     def test_jump_resolves_per_hop_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = Path(temp_dir) / "config"
