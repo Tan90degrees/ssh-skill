@@ -257,8 +257,11 @@ class SFTPTransfer:
             try:
                 remote_stat = self.sftp.stat(remote_path)
                 resume_offset = remote_stat.st_size
-                if resume_offset >= local_size:
-                    # 文件已完整上传
+                if resume_offset > local_size:
+                    return TransferResult(success=False, files_failed=1,
+                                          errors=['Remote file is larger than local file; refusing resume'])
+                if resume_offset == local_size:
+                    # Size-only resume compatibility; this does not verify content.
                     return TransferResult(
                         success=True,
                         files_transferred=1,

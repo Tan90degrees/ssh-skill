@@ -71,8 +71,11 @@ def make_progress_callback(
     return callback
 
 
-def use_native_upload(params, *, resume=False, recursive=False, progress=None):
+def use_native_upload(params, *, resume=False, recursive=False, progress=None, remote_path=None):
     """Select by required capabilities, never by file size."""
+    # Legacy SCP interprets remote paths through a shell. Keep unusual paths on SFTP.
+    if remote_path is not None and not re.fullmatch(r'[a-zA-Z0-9_./+~-]+', remote_path):
+        return False
     return bool(params.get('key_file') and not params.get('password')
                 and not resume and not recursive and progress is not True)
 
@@ -105,8 +108,14 @@ def _legacy_main(argv=None):
 
         use_native = use_native_upload(
             params, resume=args.resume, recursive=args.recursive,
-            progress=args.progress,
+            progress=args.progress, remote_path=remote_path,
         )
+
+        local_path = os.path.abspath(args.local_path)
+        if not os.path.isfile(local_path) and not os.path.isdir(local_path):
+            raise FileNotFoundError(local_path)
+        if os.path.isdir(local_path) and not args.recursive:
+            raise ValueError('Directory upload requires --recursive')
 
         if use_native:
             # 使用原生 SSH（简单上传，性能更好）

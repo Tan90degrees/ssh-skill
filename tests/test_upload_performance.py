@@ -1,4 +1,3 @@
-import io
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +19,8 @@ class UploadPerformanceTests(unittest.TestCase):
         for options in ({"resume": True}, {"recursive": True}, {"progress": True}):
             self.assertFalse(use_native_upload(params, **options))
         self.assertFalse(use_native_upload({"key_file": "key", "password": "test"}))
+        self.assertFalse(use_native_upload(params, remote_path='/tmp/a b'))
+        self.assertFalse(use_native_upload(params, remote_path='/tmp/$(name)'))
 
     def test_scp_tuning_is_capability_gated(self):
         for usage, expected in (
@@ -59,6 +60,17 @@ class UploadPerformanceTests(unittest.TestCase):
             self.assertTrue(result.success, result.errors)
             remote.set_pipelined.assert_called_once_with(True)
             remote.write.assert_called_once_with(b"efgh")
+
+    def test_resume_rejects_oversized_remote(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local = Path(temp_dir) / "file.bin"
+            local.write_bytes(b"abc")
+            sftp = MagicMock()
+            sftp.stat.return_value.st_mode = 0o100644
+            sftp.stat.return_value.st_size = 10
+            result = SFTPTransfer(sftp).upload_file(str(local), "/tmp/file.bin", resume=True)
+            self.assertFalse(result.success)
+            sftp.open.assert_not_called()
 
     def test_jump_resolves_per_hop_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:

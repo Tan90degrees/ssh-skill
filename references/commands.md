@@ -118,3 +118,21 @@ commands are diagnostic and lifecycle controls, not required before each exec.
 Published legacy filenames remain available. Their default path delegates to
 the v4 result contract. Use `--legacy-json` only for a known v3 consumer; it
 does not restore unsafe host-key, retry, output, or cluster behavior.
+
+### Upload throughput
+
+For ordinary key-authenticated files, use the default upload command (or
+`--no-progress`). Native OpenSSH is used regardless of file size. For files
+at least 8 MiB, supported SCP clients use 128 in-flight SFTP requests and a
+64 KiB requested buffer; older clients retain their defaults. The remote
+parent directory must already exist for native SCP. Use the SFTP path
+(`--progress`, `--resume`, or `--recursive` as appropriate) when parent
+creation or detailed transfer progress is needed. Password authentication
+and paths with shell-sensitive characters use SFTP as well.
+
+For an apples-to-apples benchmark, compare the same large file on the same
+host and destination filesystem using default upload, `--progress` (SFTP),
+and WinSCP in SFTP mode. Record elapsed time and verify the remote checksum.
+Use distinct destination filenames and avoid concurrent transfers. A resumed
+file must have a matching prefix; matching sizes alone do not prove content
+identity. Do not resume unrelated files.
