@@ -89,20 +89,20 @@ def _legacy_main(argv=None):
     args = parser.parse_args(argv)
     remote_path = _fix_remote_path(args.remote_path)
 
+    client = ssh_client = sftp = None
     try:
         # 加载配置
         from config_v3 import SSHConfigLoaderV3
         loader = SSHConfigLoaderV3()
         params = loader.get_connection_params(args.alias)
 
-        has_key = params.get('key_file') is not None
-        has_password = params.get('password') is not None
-
         # 对于下载，无法提前知道远程文件大小，所以不做大文件判断
         # 如果用户明确需要进度显示，可以使用 --resume 参数强制使用 Paramiko SFTP
         # 智能选择：密钥认证且不需要高级功能时，使用原生 SSH
         # 断点续传、递归下载、密码认证时使用 Paramiko SFTP
-        use_native = has_key and not has_password and not args.resume and not args.recursive
+        from ssh_upload import use_native_upload
+        use_native = use_native_upload(params, resume=args.resume, recursive=args.recursive,
+                                       progress=args.progress, remote_path=remote_path)
 
         if use_native:
             # 使用原生 SSH（简单下载，性能更好）
@@ -126,6 +126,7 @@ def _legacy_main(argv=None):
                 password=params.get('password'),
                 key_file=params.get('key_file'),
                 timeout=30,
+                jump_hosts=loader.resolve_jump_hosts(params.get('proxy_jump')),
                 transfer_timeout=None  # 大文件传输不设超时限制
             )
 
@@ -157,9 +158,6 @@ def _legacy_main(argv=None):
             result = transfer.download_file(remote_path, args.local_path,
                                             resume=args.resume)
 
-        # 关闭 SFTP
-        sftp.close()
-
         # 输出结果
         output = result.to_dict()
         print(json.dumps(output, ensure_ascii=True, indent=2))
@@ -183,6 +181,20 @@ def _legacy_main(argv=None):
             'error': f'Download error: {e}'
         }, ensure_ascii=True, indent=2), file=sys.stderr)
         sys.exit(1)
+
+    finally:
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        if client is not None and getattr(client, 'jump_hosts', None):
+            if ssh_client is not None:
+                try:
+                    ssh_client.close()
+                except Exception:
+                    pass
+            client._cleanup_jump_connections()
 
 
 def main(argv=None):

@@ -11,6 +11,7 @@
 """
 
 import subprocess
+import re
 import os
 import tempfile
 from typing import Any, Dict, Optional, Iterator
@@ -19,6 +20,24 @@ from dataclasses import dataclass, field
 from openssh_transport import OpenSSHOptions, run_openssh
 from output_limits import collect_text
 from platform_adapter import find_openssh, normalize_platform
+
+
+def _scp_tuning_args(executable="scp"):
+    """Probe the actual executable without connecting to a server.
+    Older OpenSSH builds do not accept -X (introduced in 9.5).
+    """
+    try:
+        probe = subprocess.run(
+            [executable], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    usage = (probe.stdout or "") + (probe.stderr or "")
+    if re.search(r"-X\s+\S+", usage):
+        return ["-X", "nrequests=128", "-X", "buffer=65536"]
+    return []
 
 
 @dataclass
@@ -196,7 +215,7 @@ class NativeSSHClient:
         Args:
             local_path: 本地文件路径
             remote_path: 远程文件路径
-            timeout: 超时时间（秒），None 表示根据文件大小自动计算
+            timeout: 总超时时间（秒），None 表示不限制传输总时间
             show_progress: 是否显示传输进度
 
         Returns:
@@ -212,21 +231,19 @@ class NativeSSHClient:
             )
 
         try:
-            # 根据文件大小自动计算超时时间
-            if timeout is None:
-                file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
-                # 假设最低速度 1MB/s，加上 60 秒缓冲时间
-                calculated_timeout = int(file_size_mb / 1.0) + 60
-                # 最小 60 秒，最大 3600 秒（1小时）
-                actual_timeout = max(60, min(calculated_timeout, 3600))
-            else:
-                actual_timeout = timeout
-
+            # No size-based total deadline: slow but active transfers are valid.
+            # Use SSH keepalives to detect a dead connection.
+            actual_timeout = timeout
             args = ["scp"]
+            if os.path.getsize(local_path) >= 8 * 1024 * 1024:
+                args.extend(_scp_tuning_args(args[0]))
 
             # 基本参数
             args.extend(["-P", str(self.port)])
             args.extend(["-o", "StrictHostKeyChecking=accept-new"])
+            args.extend(["-o", f"ConnectTimeout={self.timeout}",
+                         "-o", "ServerAliveInterval=15",
+                         "-o", "ServerAliveCountMax=4"])
 
             # 密钥文件
             if self.key_file:
@@ -269,7 +286,7 @@ class NativeSSHClient:
             return SSHResult(
                 success=False,
                 stdout="",
-                stderr=f"Upload timeout after {timeout or self.timeout} seconds",
+                stderr=f"Upload timeout after {timeout} seconds",
                 exit_code=-1
             )
         except Exception as e:

@@ -457,7 +457,7 @@ class ParamikoClient:
                 jump_host = first_jump.get('host')
                 jump_user = first_jump.get('user', self.user)
                 jump_port = first_jump.get('port', 22)
-                jump_password = first_jump.get('password', self.password)
+                jump_password = first_jump.get('password')
                 jump_key_file = first_jump.get('key_file')
 
             # 连接到第一个跳板机
@@ -471,17 +471,14 @@ class ParamikoClient:
                     look_for_keys=False,
                     allow_agent=False
                 )
-            elif jump_key_file:
-                pkey = paramiko.RSAKey.from_private_key_file(jump_key_file)
+            else:
                 current_client.connect(
                     hostname=jump_host,
                     port=jump_port,
                     username=jump_user,
-                    pkey=pkey,
+                    key_filename=jump_key_file,
                     timeout=self.timeout
                 )
-            else:
-                raise ValueError(f"跳板机 {jump_host} 必须提供 password 或 key_file")
 
             self._jump_clients.append(current_client)
 
@@ -499,7 +496,7 @@ class ParamikoClient:
                     jump_host = jump.get('host')
                     jump_user = jump.get('user', self.user)
                     jump_port = jump.get('port', 22)
-                    jump_password = jump.get('password', self.password)
+                    jump_password = jump.get('password')
                     jump_key_file = jump.get('key_file')
 
                 # 通过当前跳板机创建到下一个跳板机的通道
@@ -523,18 +520,15 @@ class ParamikoClient:
                         look_for_keys=False,
                         allow_agent=False
                     )
-                elif jump_key_file:
-                    pkey = paramiko.RSAKey.from_private_key_file(jump_key_file)
+                else:
                     next_client.connect(
                         hostname=jump_host,
                         port=jump_port,
                         username=jump_user,
-                        pkey=pkey,
+                        key_filename=jump_key_file,
                         sock=channel,
                         timeout=self.timeout
                     )
-                else:
-                    raise ValueError(f"跳板机 {jump_host} 必须提供 password 或 key_file")
 
                 self._jump_clients.append(next_client)
                 current_client = next_client
@@ -561,17 +555,12 @@ class ParamikoClient:
                     allow_agent=False
                 )
             elif self.key_file:
-                pkey = None
-                if self.key_passphrase:
-                    pkey = paramiko.RSAKey.from_private_key_file(self.key_file, password=self.key_passphrase)
-                else:
-                    pkey = paramiko.RSAKey.from_private_key_file(self.key_file)
-
                 target_client.connect(
                     hostname=self.host,
                     port=self.port,
                     username=self.user,
-                    pkey=pkey,
+                    key_filename=os.path.expanduser(self.key_file),
+                    passphrase=self.key_passphrase,
                     sock=channel,
                     timeout=self.timeout
                 )

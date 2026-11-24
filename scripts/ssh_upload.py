@@ -26,6 +26,7 @@ import sys
 import os
 import json
 import argparse
+import asyncio
 import re
 import time
 from typing import TextIO
@@ -71,6 +72,15 @@ def make_progress_callback(
     return callback
 
 
+def use_native_upload(params, *, resume=False, recursive=False, progress=None, remote_path=None):
+    """Select by required capabilities, never by file size."""
+    # Legacy SCP interprets remote paths through a shell. Keep unusual paths on SFTP.
+    if remote_path is not None and not re.fullmatch(r'[a-zA-Z0-9_./+~-]+', remote_path):
+        return False
+    return bool(params.get('key_file') and not params.get('password')
+                and not resume and not recursive and progress is not True)
+
+
 def _legacy_main(argv=None):
     parser = argparse.ArgumentParser(description='SSH file upload tool v3.1')
     parser.add_argument('alias', help='SSH host alias from ~/.ssh/config')
@@ -80,6 +90,10 @@ def _legacy_main(argv=None):
                         help='Enable resume for interrupted transfers')
     parser.add_argument('--recursive', action='store_true',
                         help='Upload directory recursively')
+    parser.add_argument('--backend', choices=('auto', 'openssh', 'paramiko', 'asyncssh'), default='auto',
+                        help='Transfer backend (AsyncSSH is optional)')
+    parser.add_argument('--parallel', type=int, choices=range(1, 9), default=4,
+                        help='Concurrent directory uploads (1-8; default 4)')
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument('--progress', dest='progress', action='store_true',
                                 help='Enable bounded JSONL progress on stderr')
@@ -90,32 +104,43 @@ def _legacy_main(argv=None):
     args = parser.parse_args(argv)
     remote_path = _fix_remote_path(args.remote_path)
 
+    client = ssh_client = sftp = None
     try:
         # 加载配置
         from config_v3 import SSHConfigLoaderV3
         loader = SSHConfigLoaderV3()
         params = loader.get_connection_params(args.alias)
 
-        has_key = params.get('key_file') is not None
-        has_password = params.get('password') is not None
+        use_native = use_native_upload(
+            params, resume=args.resume, recursive=args.recursive,
+            progress=args.progress, remote_path=remote_path,
+        )
 
-        # 检查文件大小，大文件（>80MB）使用 Paramiko SFTP 以显示进度
-        local_path_abs = os.path.abspath(args.local_path)
-        is_large_file = False
-        if os.path.isfile(local_path_abs):
-            file_size_mb = os.path.getsize(local_path_abs) / (1024 * 1024)
-            is_large_file = file_size_mb > 80  # 80MB 阈值
+        local_path = os.path.abspath(args.local_path)
+        if not os.path.isfile(local_path) and not os.path.isdir(local_path):
+            raise FileNotFoundError(local_path)
+        if os.path.isdir(local_path) and not args.recursive:
+            raise ValueError('Directory upload requires --recursive')
 
-        # 智能选择：密钥认证且不需要高级功能且文件不大时，使用原生 SSH
-        # 大文件、断点续传、递归上传、密码认证时使用 Paramiko SFTP
-        use_native = has_key and not has_password and not args.resume and not args.recursive and not is_large_file
+        if args.backend == 'openssh' and not use_native:
+            raise ValueError('OpenSSH backend requires key authentication, a simple path, and no resume, recursion or structured progress')
+        if args.backend == 'asyncssh':
+            if args.resume or args.recursive or not os.path.isfile(local_path):
+                raise ValueError('AsyncSSH currently supports single-file uploads without resume')
+            from asyncssh_transfer import upload_asyncssh
+            result = asyncio.run(upload_asyncssh(
+                params, loader.resolve_jump_hosts(params.get('proxy_jump')),
+                local_path, remote_path, make_progress_callback(args.progress),
+            ))
+            print(json.dumps({**result.to_dict(), 'backend': 'asyncssh'}, ensure_ascii=True, indent=2))
+            sys.exit(0 if result.success else 1)
 
-        if use_native:
+        if use_native and args.backend != 'paramiko':
             # 使用原生 SSH（简单上传，性能更好）
             client = loader.from_alias(args.alias)
             local_path = os.path.abspath(args.local_path)
 
-            if not os.path.exists(local_path):
+            if not os.path.isfile(local_path):
                 print(json.dumps({
                     'success': False,
                     'error': f'Path not found: {args.local_path}'
@@ -127,7 +152,8 @@ def _legacy_main(argv=None):
                 'success': result.success,
                 'stdout': result.stdout,
                 'stderr': result.stderr,
-                'exit_code': result.exit_code
+                'exit_code': result.exit_code,
+                'backend': 'openssh'
             }, ensure_ascii=True, indent=2))
             sys.exit(0 if result.success else 1)
         else:
@@ -140,6 +166,7 @@ def _legacy_main(argv=None):
                 password=params.get('password'),
                 key_file=params.get('key_file'),
                 timeout=30,
+                jump_hosts=loader.resolve_jump_hosts(params.get('proxy_jump')),
                 transfer_timeout=None  # 大文件传输不设超时限制
             )
 
@@ -148,7 +175,7 @@ def _legacy_main(argv=None):
             sftp = ssh_client.open_sftp()
 
             # 设置 SFTP 超时（大文件传输使用无限制）
-            sftp.get_channel().settimeout(None)
+            sftp.get_channel().settimeout(120)
 
             # 创建传输器
             from sftp_transfer import SFTPTransfer
@@ -165,8 +192,15 @@ def _legacy_main(argv=None):
                     'error': f'"{args.local_path}" is a directory. Use --recursive to upload directories.'
                 }, ensure_ascii=True, indent=2), file=sys.stderr)
                 sys.exit(1)
-            result = transfer.upload_directory(local_path, remote_path,
-                                               resume=args.resume)
+            def sftp_factory():
+                channel = ssh_client.open_sftp()
+                channel.get_channel().settimeout(120)
+                return channel
+
+            result = transfer.upload_directory(
+                local_path, remote_path, resume=args.resume,
+                max_workers=args.parallel, sftp_factory=sftp_factory,
+            )
         elif os.path.isfile(local_path):
             result = transfer.upload_file(local_path, remote_path,
                                           resume=args.resume)
@@ -177,11 +211,8 @@ def _legacy_main(argv=None):
             }, ensure_ascii=True, indent=2), file=sys.stderr)
             sys.exit(1)
 
-        # 关闭 SFTP
-        sftp.close()
-
         # 输出结果
-        output = result.to_dict()
+        output = {**result.to_dict(), 'backend': 'paramiko'}
         print(json.dumps(output, ensure_ascii=True, indent=2))
         sys.exit(0 if result.success else 1)
 
@@ -203,6 +234,20 @@ def _legacy_main(argv=None):
             'error': f'Upload error: {e}'
         }, ensure_ascii=True, indent=2), file=sys.stderr)
         sys.exit(1)
+
+    finally:
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        if client is not None and getattr(client, 'jump_hosts', None):
+            if ssh_client is not None:
+                try:
+                    ssh_client.close()
+                except Exception:
+                    pass
+            client._cleanup_jump_connections()
 
 
 def main(argv=None):

@@ -248,6 +248,39 @@ class SSHConfigLoaderV3:
 
         return params
 
+    def resolve_jump_hosts(self, proxy_jump: Optional[str]) -> List[dict]:
+        """Resolve explicit ProxyJump hops, including per-hop credentials.
+
+        Never send the destination password to a jump host.
+        """
+        if not proxy_jump or proxy_jump.lower() == 'none':
+            return []
+        config = paramiko.SSHConfig()
+        with open(self.config_path, 'r', encoding='utf-8') as stream:
+            config.parse(stream)
+        result = []
+        for item in proxy_jump.split(','):
+            match = re.fullmatch(r'(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]]+\]|[^:]+)(?::(?P<port>\d+))?', item.strip())
+            if not match:
+                raise ValueError("Unsupported ProxyJump entry")
+            alias = match.group('host').strip('[]')
+            hop = config.lookup(alias)
+            if hop.get('proxyjump', 'none').lower() != 'none':
+                raise ValueError("Nested ProxyJump must be expressed as an explicit comma-separated chain")
+            identities = hop.get('identityfile') or []
+            if isinstance(identities, str):
+                identities = [identities]
+            metadata = self.load_metadata(alias)
+            result.append({
+                'host': hop.get('hostname', alias),
+                'user': match.group('user') or hop.get('user') or None,
+                'port': int(match.group('port') or hop.get('port', 22)),
+                'password': metadata.get('password') or None,
+                'key_file': os.path.expanduser(identities[0]) if identities else None,
+            })
+        # Paramiko uses the local username if username is None.
+        return result
+
     def from_alias(self, alias: str):
         """
         通过别名创建 SSH 客户端（智能选择）

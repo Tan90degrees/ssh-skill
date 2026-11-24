@@ -8,10 +8,11 @@ import os
 import posixpath
 import stat
 import time
+import threading
 import json
 import sys
 from typing import Optional, Callable, List, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
 
 try:
@@ -22,6 +23,8 @@ except ImportError:
 
 CHUNK_SIZE = 128 * 1024  # 128KB 传输块（优化大文件传输性能）
 MAX_RESULT_ITEMS = 100
+DOWNLOAD_REQUEST_SIZE = 32 * 1024
+DOWNLOAD_REQUESTS = 64
 
 
 def _bounded_items(values: list, limit: int = MAX_RESULT_ITEMS) -> list:
@@ -225,7 +228,7 @@ class SFTPTransfer:
         self.progress_callback = progress_callback
 
     def upload_file(self, local_path: str, remote_path: str,
-                    resume: bool = False) -> TransferResult:
+                    resume: bool = False, *, parent_prepared: bool = False) -> TransferResult:
         """
         上传单个文件，支持断点续传
 
@@ -248,7 +251,7 @@ class SFTPTransfer:
 
         # 确保远程目录存在
         remote_dir = posixpath.dirname(remote_path)
-        if remote_dir:
+        if remote_dir and not parent_prepared:
             _remote_mkdir_p(self.sftp, remote_dir)
 
         # 断点续传：获取远程已有大小
@@ -257,8 +260,11 @@ class SFTPTransfer:
             try:
                 remote_stat = self.sftp.stat(remote_path)
                 resume_offset = remote_stat.st_size
-                if resume_offset >= local_size:
-                    # 文件已完整上传
+                if resume_offset > local_size:
+                    return TransferResult(success=False, files_failed=1,
+                                          errors=['Remote file is larger than local file; refusing resume'])
+                if resume_offset == local_size:
+                    # Size-only resume compatibility; this does not verify content.
                     return TransferResult(
                         success=True,
                         files_transferred=1,
@@ -287,19 +293,6 @@ class SFTPTransfer:
                 with open(local_path, 'rb') as local_f:
                     local_f.seek(resume_offset)
                     with self.sftp.open(remote_path, 'ab') as remote_f:
-                        while True:
-                            chunk = local_f.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            remote_f.write(chunk)
-                            progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
-                                self.progress_callback(progress)
-            else:
-                # 全新上传：使用分块写入以支持进度回调
-                with open(local_path, 'rb') as local_f:
-                    with self.sftp.open(remote_path, 'wb') as remote_f:
-                        # 设置预取缓冲区大小以提升性能
                         remote_f.set_pipelined(True)
                         while True:
                             chunk = local_f.read(CHUNK_SIZE)
@@ -307,8 +300,27 @@ class SFTPTransfer:
                                 break
                             remote_f.write(chunk)
                             progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
+                            if self.progress_callback and progress.transferred_bytes < local_size:
                                 self.progress_callback(progress)
+            else:
+                # 全新上传：使用分块写入以支持进度回调
+                with open(local_path, 'rb') as local_f:
+                    with self.sftp.open(remote_path, 'wb') as remote_f:
+                        # Pipeline SFTP writes instead of waiting for every ACK.
+                        remote_f.set_pipelined(True)
+                        while True:
+                            chunk = local_f.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            remote_f.write(chunk)
+                            progress.transferred_bytes += len(chunk)
+                            if self.progress_callback and progress.transferred_bytes < local_size:
+                                self.progress_callback(progress)
+
+            if self.sftp.stat(remote_path).st_size != local_size:
+                raise IOError("Remote size does not match local file size")
+            if self.progress_callback:
+                self.progress_callback(progress)
 
             return TransferResult(
                 success=True,
@@ -363,7 +375,10 @@ class SFTPTransfer:
         resume_offset = 0
         if resume and os.path.exists(local_path):
             resume_offset = os.path.getsize(local_path)
-            if resume_offset >= remote_size:
+            if resume_offset > remote_size:
+                return TransferResult(success=False, files_failed=1,
+                                      errors=['Local file is larger than remote file; refusing resume'])
+            if resume_offset == remote_size:
                 return TransferResult(
                     success=True,
                     files_transferred=1,
@@ -384,31 +399,33 @@ class SFTPTransfer:
         )
 
         try:
-            if resume_offset > 0:
-                # 断点续传
-                with self.sftp.open(remote_path, 'rb') as remote_f:
-                    remote_f.seek(resume_offset)
-                    with open(local_path, 'ab') as local_f:
-                        while True:
-                            chunk = remote_f.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            local_f.write(chunk)
-                            progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
+            # readv pipelines a bounded batch of requests. Avoid prefetching
+            # the whole file, which can allocate millions of request records.
+            mode = 'ab' if resume_offset else 'wb'
+            with self.sftp.open(remote_path, 'rb') as remote_f:
+                with open(local_path, mode) as local_f:
+                    offset = resume_offset
+                    while offset < remote_size:
+                        batch_end = min(remote_size, offset + DOWNLOAD_REQUEST_SIZE * DOWNLOAD_REQUESTS)
+                        chunks = [(pos, min(DOWNLOAD_REQUEST_SIZE, batch_end - pos))
+                                  for pos in range(offset, batch_end, DOWNLOAD_REQUEST_SIZE)]
+                        blocks = iter(remote_f.readv(chunks))
+                        for _, expected in chunks:
+                            block = next(blocks, b'')
+                            if len(block) != expected:
+                                raise IOError("Remote file changed or returned a short read")
+                            local_f.write(block)
+                            offset += len(block)
+                            progress.transferred_bytes = offset
+                            if self.progress_callback and offset < remote_size:
                                 self.progress_callback(progress)
-            else:
-                # 全新下载
-                with self.sftp.open(remote_path, 'rb') as remote_f:
-                    with open(local_path, 'wb') as local_f:
-                        while True:
-                            chunk = remote_f.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            local_f.write(chunk)
-                            progress.transferred_bytes += len(chunk)
-                            if self.progress_callback:
-                                self.progress_callback(progress)
+                        # Exhaust generator so cleanup runs before the next batch.
+                        if next(blocks, None) is not None:
+                            raise IOError("Unexpected extra SFTP read data")
+            if os.path.getsize(local_path) != remote_size or self.sftp.stat(remote_path).st_size != remote_size:
+                raise IOError("File size changed during download")
+            if self.progress_callback:
+                self.progress_callback(progress)
 
             return TransferResult(
                 success=True,
@@ -431,7 +448,8 @@ class SFTPTransfer:
             )
 
     def upload_directory(self, local_dir: str, remote_dir: str,
-                         resume: bool = False) -> TransferResult:
+                         resume: bool = False, *, max_workers: int = 1,
+                         sftp_factory: Optional[Callable] = None) -> TransferResult:
         """
         递归上传目录
 
@@ -446,34 +464,53 @@ class SFTPTransfer:
                 success=False, errors=[f"本地目录不存在: {local_dir}"]
             )
 
-        # 确保远程根目录存在
-        _remote_mkdir_p(self.sftp, remote_dir)
+        if not 1 <= max_workers <= 8:
+            raise ValueError("max_workers must be between 1 and 8")
 
-        result = TransferResult(success=True)
+        def tasks():
+            def fail_walk(exc):
+                raise exc
+            for root, dirs, files in os.walk(local_dir, onerror=fail_walk):
+                rel_path = os.path.relpath(root, local_dir)
+                current_remote = remote_dir if rel_path == '.' else posixpath.join(
+                    remote_dir, *rel_path.split(os.sep))
+                _remote_mkdir_p(self.sftp, current_remote)
+                for filename in files:
+                    yield os.path.join(root, filename), posixpath.join(current_remote, filename)
 
-        for root, dirs, files in os.walk(local_dir):
-            # 计算相对路径
-            rel_path = os.path.relpath(root, local_dir)
-            if rel_path == '.':
-                current_remote = remote_dir
-            else:
-                current_remote = remote_dir.rstrip('/') + '/' + rel_path.replace('\\', '/')
+        if max_workers == 1 or sftp_factory is None:
+            result = TransferResult(success=True)
+            for local_file, remote_file in tasks():
+                result.merge(self.upload_file(local_file, remote_file, resume=resume,
+                                              parent_prepared=True))
+            return result
 
-            # 创建远程子目录
-            _remote_mkdir_p(self.sftp, current_remote)
+        # Emit one aggregate stream, not one "100%" event per small file.
+        callback = self.progress_callback
+        total = 0
+        if callback:
+            def fail_walk(exc):
+                raise exc
+            for root, _, files in os.walk(local_dir, onerror=fail_walk):
+                total += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+        progress = TransferProgress(local_dir, total, 0, time.time())
+        lock = threading.Lock()
 
-            # 上传文件
-            for filename in files:
-                local_file = os.path.join(root, filename)
-                remote_file = current_remote.rstrip('/') + '/' + filename
+        def advance(delta):
+            if callback:
+                with lock:
+                    progress.transferred_bytes += delta
+                    # Reserve the final event for successful completion.
+                    if 0 < progress.transferred_bytes < total:
+                        callback(progress)
 
-                file_result = self.upload_file(local_file, remote_file, resume=resume)
-
-                result.merge(file_result)
-
-        if result.files_failed > 0:
-            result.success = False
-
+        result = parallel_upload(sftp_factory, tasks(), resume=resume,
+                                 max_workers=max_workers, parent_prepared=True,
+                                 advance=advance if callback else None)
+        if result.success and callback:
+            progress.total_bytes = result.bytes_transferred
+            progress.transferred_bytes = result.bytes_transferred
+            callback(progress)
         return result
 
     def download_directory(self, remote_dir: str, local_dir: str,
@@ -524,45 +561,67 @@ class SFTPTransfer:
                 result.merge(file_result)
 
 
-def parallel_upload(sftp_factory: Callable, file_list: List[Tuple[str, str]],
+def parallel_upload(sftp_factory: Callable, file_list,
                     resume: bool = False, max_workers: int = 4,
-                    progress_callback: Optional[Callable] = None) -> TransferResult:
-    """
-    并发上传多个文件
+                    progress_callback: Optional[Callable] = None, *,
+                    parent_prepared: bool = False,
+                    advance: Optional[Callable] = None) -> TransferResult:
+    """Bounded upload queue with one reusable SFTP client per worker.
 
-    Args:
-        sftp_factory: 创建 SFTP 客户端的工厂函数（每个线程需要独立连接）
-        file_list: [(local_path, remote_path), ...] 文件对列表
-        resume: 是否断点续传
-        max_workers: 最大并发数
-        progress_callback: 进度回调
+    The factory must return a distinct channel on each call. The SSH
+    transport can be shared, but SFTPClient instances must not be shared.
     """
+    if not 1 <= max_workers <= 8:
+        raise ValueError("max_workers must be between 1 and 8")
     result = TransferResult(success=True)
+    local = threading.local()
+    channels = []
+    lock = threading.Lock()
 
     def upload_one(local_path, remote_path):
-        sftp = sftp_factory()
+        reported = 0
+
+        def report(progress):
+            nonlocal reported
+            if advance:
+                advance(progress.transferred_bytes - reported)
+                reported = progress.transferred_bytes
+            if progress_callback:
+                with lock:
+                    progress_callback(progress)
+
         try:
-            transfer = SFTPTransfer(sftp, progress_callback=progress_callback)
-            return transfer.upload_file(local_path, remote_path, resume=resume)
-        finally:
+            if not hasattr(local, 'sftp'):
+                local.sftp = sftp_factory()
+                with lock:
+                    channels.append(local.sftp)
+            transfer = SFTPTransfer(local.sftp, progress_callback=report if advance or progress_callback else None)
+            file_result = transfer.upload_file(local_path, remote_path, resume=resume,
+                                               parent_prepared=parent_prepared)
+            if advance and file_result.success:
+                advance(max(0, file_result.bytes_transferred - reported))
+            return file_result
+        except Exception as exc:
+            return TransferResult(success=False, files_failed=1,
+                                  errors=[f"Upload failed {os.path.basename(local_path)}: {exc}"])
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            pending = set()
+            for lp, rp in file_list:
+                pending.add(executor.submit(upload_one, lp, rp))
+                if len(pending) >= max_workers * 2:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        result.merge(future.result())
+            for future in as_completed(pending):
+                result.merge(future.result())
+    finally:
+        for channel in channels:
             try:
-                sftp.close()
+                channel.close()
             except Exception:
                 pass
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(upload_one, lp, rp): (lp, rp)
-            for lp, rp in file_list
-        }
-
-        for future in as_completed(futures):
-            file_result = future.result()
-            result.merge(file_result)
-
-    if result.files_failed > 0:
-        result.success = False
-
     return result
 
 

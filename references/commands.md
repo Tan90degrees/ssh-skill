@@ -118,3 +118,39 @@ commands are diagnostic and lifecycle controls, not required before each exec.
 Published legacy filenames remain available. Their default path delegates to
 the v4 result contract. Use `--legacy-json` only for a known v3 consumer; it
 does not restore unsafe host-key, retry, output, or cluster behavior.
+
+### Upload throughput
+
+For ordinary key-authenticated files, use the default upload command (or
+`--no-progress`). Native OpenSSH is used regardless of file size. For files
+at least 8 MiB, supported SCP clients use 128 in-flight SFTP requests and a
+64 KiB requested buffer; older clients retain their defaults. The remote
+parent directory must already exist for native SCP. Use the SFTP path
+(`--progress`, `--resume`, or `--recursive` as appropriate) when parent
+creation or detailed transfer progress is needed. Password authentication
+and paths with shell-sensitive characters use SFTP as well.
+
+For an apples-to-apples benchmark, compare the same large file on the same
+host and destination filesystem using default upload, `--progress` (SFTP),
+and WinSCP in SFTP mode. Record elapsed time and verify the remote checksum.
+Use distinct destination filenames and avoid concurrent transfers. A resumed
+file must have a matching prefix; matching sizes alone do not prove content
+identity. Do not resume unrelated files.
+
+Directory uploads use four reusable SFTP channels on one SSH connection by
+default. Set `--parallel 1` for servers with strict session limits, or choose
+up to 8. The parallel directory progress stream reports aggregate bytes.
+
+Use `--backend paramiko` to force the compatible Python SFTP path. An optional
+single-file high-throughput backend is available with `--backend asyncssh`;
+install it with `python -m pip install asyncssh`. It uses the server-negotiated
+block size, at most 64 outstanding requests, and structured progress. Verify
+and enroll the target and jump host keys in the standard known_hosts file
+before use. The backend rejects unknown or changed keys and never falls back
+automatically after a connection or transfer error. Resume and recursive
+uploads still use Paramiko. Default auto selection remains unchanged pending
+performance and integration validation.
+
+Paramiko downloads also pipeline reads in bounded 64-request batches (32 KiB
+per request), including resumed downloads. This avoids whole-file prefetch
+metadata growth and checks sizes before reporting successful completion.
